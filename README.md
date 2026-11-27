@@ -10,6 +10,7 @@ validated JSON responses through FastAPI.
 - Current conditions for a city.
 - Daily forecasts for 1–7 days.
 - Concurrent digests for up to five cities, with a readable summary for each.
+- A mobile-first frontend for forecasts and multi-city weather comparisons.
 - In-memory TTL caching for geocoding and weather lookups.
 - `X-Cache: HIT` / `X-Cache: MISS` response headers.
 - Consistent JSON errors and a single retry for transient provider failures.
@@ -25,6 +26,7 @@ validated JSON responses through FastAPI.
 | Weather provider | Open-Meteo |
 | Cache | `cachetools.TTLCache` |
 | ASGI server | Uvicorn |
+| Web frontend | React, TypeScript, Vite, Tailwind CSS, TanStack Query, Recharts |
 | Integration tests | pytest, FastAPI `TestClient`, respx |
 | Linting and CI | Ruff, GitHub Actions |
 
@@ -80,6 +82,59 @@ python -m uvicorn app.main:app --reload
 The API is available at <http://localhost:8000>. Interactive documentation is
 at <http://localhost:8000/docs>.
 
+## Frontend
+
+The frontend is a React + TypeScript single-page app built with Vite and
+Tailwind CSS. It uses TanStack Query for API requests, Recharts for forecast
+charts, and lucide-react for icons.
+
+### Development workflow
+
+Use two terminals from the repository root.
+
+Terminal 1 — start the API:
+
+```powershell
+python -m uvicorn app.main:app --reload
+```
+
+Terminal 2 — install frontend dependencies and start Vite:
+
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
+
+Open the frontend URL printed by Vite (usually <http://localhost:5173>).
+Vite proxies `/weather`, `/digest`, and `/health` requests to the API at
+`http://127.0.0.1:8000`.
+
+### Production build
+
+Build the static frontend bundle:
+
+```powershell
+cd frontend
+npm ci
+npm run build
+```
+
+When `frontend/dist` exists, FastAPI serves the app at `/`, its generated files
+from `/assets`, and the SPA entry point for unknown non-API routes. To serve the
+built app locally, start Uvicorn from the repository root after building.
+Docker Compose builds the frontend and API image together, then serves both at
+<http://localhost:8000>:
+
+```powershell
+docker compose up --build
+```
+
+### Screenshot
+
+> Screenshot placeholder: add `docs/weather-digest-screenshot.png` and replace
+> this note with the image.
+
 ### Docker Compose
 
 Build and start the API:
@@ -94,8 +149,8 @@ Open <http://localhost:8000>, or stop the service with:
 docker compose down
 ```
 
-The image uses a multi-stage Python slim build and runs Uvicorn as a non-root
-user.
+The image uses a Node stage for the frontend and Python slim stages for the
+API. The runtime runs Uvicorn as a non-root user.
 
 ## Configuration
 
@@ -127,7 +182,7 @@ All weather endpoints require a city name with at least two characters.
 | `GET` | `/weather/current` | `city` (required) | Current conditions for one city. |
 | `GET` | `/weather/forecast` | `city` (required), `days` (1–7, default `7`) | Current conditions and daily forecast. |
 | `GET` | `/digest` | `cities` (required, comma-separated, up to 5) | Concurrent current-weather summaries for multiple cities. |
-| `GET` | `/` | — | Service name and links to health/docs. |
+| `GET` | `/` | — | Frontend when built, otherwise service name and health/docs links. |
 | `GET` | `/health` | — | Health check. |
 
 ### Current weather
@@ -292,7 +347,7 @@ on pushes and pull requests using Python 3.11.
 │   ├── test_api_respx.py       # Mocked API integration tests
 │   ├── test_open_meteo.py      # Provider-service tests
 │   └── test_weather_routes.py  # Route validation and behavior tests
-├── .github/workflows/ci.yml    # Ruff and pytest CI
+├── .github/workflows/ci.yml    # Frontend build/lint, Ruff, and pytest CI
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

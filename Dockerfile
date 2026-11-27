@@ -1,4 +1,12 @@
-FROM python:3.11-slim AS builder
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+FROM python:3.11-slim AS python-builder
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
@@ -19,8 +27,9 @@ RUN groupadd --system app \
     && useradd --system --gid app --create-home app
 
 WORKDIR /app
-COPY --from=builder /opt/venv /opt/venv
+COPY --from=python-builder /opt/venv /opt/venv
 COPY --chown=app:app app ./app
+COPY --from=frontend-builder --chown=app:app /frontend/dist ./frontend/dist
 
 USER app
 EXPOSE 8000

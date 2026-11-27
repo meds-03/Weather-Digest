@@ -3,17 +3,21 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
+from starlette.staticfiles import StaticFiles
 
 from app.exceptions import APIError
 from app.routers.weather import router as weather_router
 from app.services.open_meteo import OpenMeteoService
 
 logger = logging.getLogger(__name__)
+FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+FRONTEND_INDEX = FRONTEND_DIST / "index.html"
 
 
 async def handle_api_error(request: Request, error: APIError) -> JSONResponse:
@@ -90,11 +94,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 register_exception_handlers(app)
+if FRONTEND_DIST.is_dir():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(FRONTEND_DIST / "assets"), check_dir=False),
+        name="frontend-assets",
+    )
 app.include_router(weather_router)
 
 
-@app.get("/", response_model=dict[str, str], tags=["health"])
-def root() -> dict[str, str]:
+@app.get("/", response_model=None, tags=["health"])
+def root() -> Response | dict[str, str]:
+    if FRONTEND_INDEX.is_file():
+        return FileResponse(FRONTEND_INDEX)
     return {
         "service": "Weather Digest API",
         "health": "/health",
@@ -115,3 +127,23 @@ def health() -> dict[str, str]:
 )
 def favicon() -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+if FRONTEND_DIST.is_dir():
+
+    @app.get("/{path:path}", response_model=None, include_in_schema=False)
+    def frontend_fallback(path: str) -> Response:
+        reserved_roots = {
+            "assets",
+            "digest",
+            "docs",
+            "health",
+            "openapi.json",
+            "redoc",
+            "weather",
+        }
+        if path.split("/", maxsplit=1)[0] in reserved_roots:
+            raise StarletteHTTPException(status_code=404, detail="Not Found")
+        if not FRONTEND_INDEX.is_file():
+            raise StarletteHTTPException(status_code=404, detail="Not Found")
+        return FileResponse(FRONTEND_INDEX)

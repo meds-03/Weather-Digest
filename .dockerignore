@@ -12,6 +12,8 @@ __pycache__
 .env
 .env.*
 !.env.example
+frontend/node_modules
+frontend/dist
 tests
 requirements-dev.txt
 README.md
