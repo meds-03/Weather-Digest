@@ -5,6 +5,12 @@ and concise multi-city weather digests. The service geocodes city names and
 retrieves weather data from [Open-Meteo](https://open-meteo.com/), then returns
 validated JSON responses through FastAPI.
 
+## Live demo
+
+Live demo: [https://weather-digest.onrender.com/](https://weather-digest.onrender.com/)
+
+> Screenshot placeholder
+
 ## Features
 
 - Current conditions for a city.
