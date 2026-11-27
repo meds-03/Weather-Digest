@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: weather-digest-api
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: WEATHER_DIGEST_CACHE_TTL_SECONDS
+        value: "300"
