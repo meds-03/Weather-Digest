@@ -7,8 +7,16 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.exceptions import (
+    APIError,
+    CityNotFoundError,
+    UpstreamAPIError,
+    UpstreamTimeoutError,
+)
+from app.main import register_exception_handlers
 from app.routers.weather import get_weather_service, router
 from app.schemas import CurrentWeather, DailyForecast, DigestItem, ForecastResponse
+from app.services.cache import AsyncTTLCache
 
 
 class FakeWeatherService:
@@ -18,9 +26,19 @@ class FakeWeatherService:
         self.active_digest_calls = 0
         self.max_active_digest_calls = 0
         self.requested_days: int | None = None
+        self.current_cache: AsyncTTLCache[str, CurrentWeather] = AsyncTTLCache(300)
+        self.current_error: APIError | None = None
 
     async def get_current_weather(self, city: str) -> CurrentWeather:
         """Return a fixed current-weather response."""
+        if self.current_error is not None:
+            raise self.current_error
+        return await self.current_cache.get_or_create(
+            city,
+            lambda: self._build_current_weather(),
+        )
+
+    async def _build_current_weather(self) -> CurrentWeather:
         return CurrentWeather(
             time=datetime(2026, 11, 25, 20, 15),
             temperature_c=24,
@@ -81,6 +99,7 @@ class WeatherRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = FakeWeatherService()
         app = FastAPI()
+        register_exception_handlers(app)
         app.include_router(router)
         app.dependency_overrides[get_weather_service] = lambda: self.service
         self.client = TestClient(app)
@@ -106,6 +125,69 @@ class WeatherRouteTests(unittest.TestCase):
         response = self.client.get("/weather/current", params={"city": "T"})
 
         self.assertEqual(response.status_code, 422)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": "Invalid input",
+                "detail": "city: String should have at least 2 characters",
+            },
+        )
+
+        whitespace_city = self.client.get(
+            "/weather/current",
+            params={"city": "  "},
+        )
+        self.assertEqual(whitespace_city.status_code, 422)
+        self.assertEqual(
+            whitespace_city.json(),
+            {
+                "error": "Invalid input",
+                "detail": "city must contain at least 2 non-whitespace characters",
+            },
+        )
+
+    def test_city_not_found_uses_common_error_response(self) -> None:
+        """Return a consistent 404 response for unknown cities."""
+        self.service.current_error = CityNotFoundError("No location found")
+
+        response = self.client.get(
+            "/weather/current",
+            params={"city": "Atlantis"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.json(),
+            {"error": "City not found", "detail": "No location found"},
+        )
+        self.assertEqual(response.headers["X-Cache"], "MISS")
+
+    def test_upstream_errors_use_common_status_and_response_format(self) -> None:
+        """Map upstream failures to 502 and timeouts to 504."""
+        cases = (
+            (UpstreamAPIError("Provider failed"), 502, "Upstream API failure"),
+            (UpstreamTimeoutError("Provider timed out"), 504, "Upstream API timeout"),
+        )
+        for error, status_code, title in cases:
+            with self.subTest(status=status_code):
+                self.service.current_error = error
+                response = self.client.get(
+                    "/weather/current",
+                    params={"city": "Tunis"},
+                )
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(
+                    response.json(),
+                    {"error": title, "detail": str(error)},
+                )
+
+    def test_cache_header_reports_miss_then_hit(self) -> None:
+        """Report cache status on each response."""
+        first = self.client.get("/weather/current", params={"city": "Tunis"})
+        second = self.client.get("/weather/current", params={"city": "Tunis"})
+
+        self.assertEqual(first.headers["X-Cache"], "MISS")
+        self.assertEqual(second.headers["X-Cache"], "HIT")
 
     def test_forecast_rejects_days_outside_the_allowed_range(self) -> None:
         """Reject a forecast request exceeding the seven-day limit."""

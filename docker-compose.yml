@@ -1,0 +1,7 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      WEATHER_DIGEST_CACHE_TTL_SECONDS: ${WEATHER_DIGEST_CACHE_TTL_SECONDS:-300}

@@ -1,5 +1,6 @@
 """Async client for geocoding and weather data from Open-Meteo."""
 
+import logging
 from datetime import date, datetime
 from types import TracebackType
 from typing import Self
@@ -8,16 +9,21 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings, settings
+from app.exceptions import (
+    CityNotFoundError,
+    InvalidInputError,
+    UpstreamAPIError,
+    UpstreamTimeoutError,
+)
 from app.schemas import (
     CurrentWeather,
     DailyForecast,
     DigestItem,
     ForecastResponse,
 )
+from app.services.cache import AsyncTTLCache
 
-
-class CityNotFoundError(LookupError):
-    """Raised when Open-Meteo cannot geocode the requested city."""
+logger = logging.getLogger(__name__)
 
 
 class _GeocodingResult(BaseModel):
@@ -91,19 +97,33 @@ class _ForecastData(_CurrentResponseData):
 class OpenMeteoService:
     """Geocode cities and fetch their current and daily weather."""
 
+    MAX_RETRIES = 1
+
     def __init__(
         self,
         client: httpx.AsyncClient | None = None,
         config: Settings = settings,
     ) -> None:
         """Create the service, optionally using a caller-managed HTTP client."""
+        self._timeout = httpx.Timeout(10.0, connect=5.0)
         self._client = (
             client
             if client is not None
-            else httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+            else httpx.AsyncClient(timeout=self._timeout)
         )
         self._owns_client = client is None
         self._config = config
+        self._geocode_cache: AsyncTTLCache[str, _GeocodingResult] = AsyncTTLCache(
+            config.cache_ttl_seconds
+        )
+        self._current_cache: AsyncTTLCache[
+            tuple[float, float],
+            _CurrentData,
+        ] = AsyncTTLCache(config.cache_ttl_seconds)
+        self._forecast_cache: AsyncTTLCache[
+            tuple[float, float, int],
+            _ForecastData,
+        ] = AsyncTTLCache(config.cache_ttl_seconds)
 
     async def __aenter__(self) -> Self:
         """Return this service for use as an async context manager."""
@@ -141,7 +161,7 @@ class OpenMeteoService:
     ) -> ForecastResponse:
         """Fetch current conditions and up to 16 days of daily forecast."""
         if not 1 <= forecast_days <= 16:
-            raise ValueError("forecast_days must be between 1 and 16")
+            raise InvalidInputError("days must be between 1 and 16")
 
         location = await self._geocode(city)
         params: dict[str, str | int | float] = {
@@ -158,27 +178,31 @@ class OpenMeteoService:
             "precipitation_unit": "mm",
             "timezone": "auto",
         }
-        response = await self._client.get(
-            str(self._config.open_meteo_forecast_base_url),
-            params=params,
+        payload = await self._forecast_cache.get_or_create(
+            (location.latitude, location.longitude, forecast_days),
+            lambda: self._fetch_forecast(params),
         )
-        response.raise_for_status()
-        payload = _ForecastData.model_validate(response.json())
 
-        return ForecastResponse(
-            city=location.display_name,
-            latitude=payload.latitude,
-            longitude=payload.longitude,
-            timezone=payload.timezone,
-            current=self._map_current(payload.current),
-            daily=self._map_daily(payload.daily),
-        )
+        try:
+            return ForecastResponse(
+                city=location.display_name,
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                timezone=payload.timezone,
+                current=self._map_current(payload.current),
+                daily=self._map_daily(payload.daily),
+            )
+        except ValueError as error:
+            logger.error("Open-Meteo returned inconsistent forecast data")
+            raise UpstreamAPIError(
+                "Weather provider returned invalid forecast data"
+            ) from error
 
     async def get_digest_item(self, city: str) -> DigestItem:
         """Fetch and summarize current conditions and rain chance for a city."""
         forecast = await self.get_forecast(city, forecast_days=1)
         if not forecast.daily:
-            raise ValueError("Open-Meteo returned no daily forecast data")
+            raise UpstreamAPIError("Weather provider returned no forecast data")
 
         current = forecast.current
         rain_chance = forecast.daily[0].precipitation_probability_max_percent
@@ -199,9 +223,19 @@ class OpenMeteoService:
         """Return the first geocoding result or raise for an unknown city."""
         city_name = city.strip()
         if not city_name:
-            raise ValueError("city must not be empty")
+            raise InvalidInputError("city must not be empty")
 
-        response = await self._client.get(
+        return await self._geocode_cache.get_or_create(
+            city_name.casefold(),
+            lambda: self._fetch_geocoding_result(city_name),
+        )
+
+    async def _fetch_geocoding_result(
+        self,
+        city_name: str,
+    ) -> _GeocodingResult:
+        """Fetch and validate a city geocoding result."""
+        response = await self._get(
             str(self._config.open_meteo_geocoding_base_url),
             params={
                 "name": city_name,
@@ -210,15 +244,30 @@ class OpenMeteoService:
                 "format": "json",
             },
         )
-        response.raise_for_status()
-        payload = _GeocodingResponse.model_validate(response.json())
+        try:
+            payload = _GeocodingResponse.model_validate(response.json())
+        except ValueError as error:
+            logger.error("Open-Meteo returned invalid geocoding data")
+            raise UpstreamAPIError(
+                "Weather provider returned invalid data"
+            ) from error
         if not payload.results:
             raise CityNotFoundError(f"No location found for {city_name!r}")
         return payload.results[0]
 
     async def _fetch_current(self, location: _GeocodingResult) -> _CurrentData:
         """Fetch and validate current weather for a geocoded location."""
-        response = await self._client.get(
+        return await self._current_cache.get_or_create(
+            (location.latitude, location.longitude),
+            lambda: self._fetch_current_data(location),
+        )
+
+    async def _fetch_current_data(
+        self,
+        location: _GeocodingResult,
+    ) -> _CurrentData:
+        """Fetch current weather data from Open-Meteo."""
+        response = await self._get(
             str(self._config.open_meteo_forecast_base_url),
             params={
                 "latitude": location.latitude,
@@ -229,9 +278,83 @@ class OpenMeteoService:
                 "timezone": "auto",
             },
         )
-        response.raise_for_status()
-        payload = _CurrentResponseData.model_validate(response.json())
+        try:
+            payload = _CurrentResponseData.model_validate(response.json())
+        except ValueError as error:
+            logger.error("Open-Meteo returned invalid current-weather data")
+            raise UpstreamAPIError(
+                "Weather provider returned invalid data"
+            ) from error
         return payload.current
+
+    async def _fetch_forecast(
+        self,
+        params: dict[str, str | int | float],
+    ) -> _ForecastData:
+        """Fetch and validate a daily forecast from Open-Meteo."""
+        response = await self._get(
+            str(self._config.open_meteo_forecast_base_url),
+            params=params,
+        )
+        try:
+            return _ForecastData.model_validate(response.json())
+        except ValueError as error:
+            logger.error("Open-Meteo returned invalid forecast data")
+            raise UpstreamAPIError(
+                "Weather provider returned invalid data"
+            ) from error
+
+    async def _get(
+        self,
+        url: str,
+        params: dict[str, str | int | float],
+    ) -> httpx.Response:
+        """Request provider data, retrying one transient failure."""
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                response = await self._client.get(
+                    url,
+                    params=params,
+                    timeout=self._timeout,
+                )
+                response.raise_for_status()
+                return response
+            except httpx.TimeoutException as error:
+                if attempt < self.MAX_RETRIES:
+                    logger.warning("Open-Meteo timed out; retrying once")
+                    continue
+                logger.error("Open-Meteo request timed out")
+                raise UpstreamTimeoutError(
+                    "Weather provider request timed out"
+                ) from error
+            except httpx.HTTPStatusError as error:
+                if (
+                    error.response.status_code >= 500
+                    and attempt < self.MAX_RETRIES
+                ):
+                    logger.warning("Open-Meteo returned a server error; retrying once")
+                    continue
+                logger.error(
+                    "Open-Meteo returned HTTP %d",
+                    error.response.status_code,
+                )
+                if error.response.status_code in (408, 504):
+                    raise UpstreamTimeoutError(
+                        "Weather provider request timed out"
+                    ) from error
+                raise UpstreamAPIError(
+                    "Weather provider request failed"
+                ) from error
+            except httpx.RequestError as error:
+                if attempt < self.MAX_RETRIES:
+                    logger.warning("Open-Meteo request failed; retrying once")
+                    continue
+                logger.error("Open-Meteo request failed")
+                raise UpstreamAPIError(
+                    "Weather provider request failed"
+                ) from error
+
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _map_current(current: _CurrentData) -> CurrentWeather:
